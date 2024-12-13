@@ -1,0 +1,170 @@
+from playwright.sync_api import sync_playwright
+from lxml import html
+import time
+import pandas as pd
+import re
+import os
+import json
+
+def scrape_google_maps(city_name, category_name):
+    extracted_data = []
+    processed_urls = set()
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=False)
+        page = browser.new_page(no_viewport=True)
+
+        search_url = f"https://www.google.com/maps/search/destinasi+wisata+{category_name.lower()}+di+{city_name.lower()}"
+
+        try:
+            print(f"Attempting to navigate to {search_url}")
+            page.goto(search_url, timeout=30000)
+        except Exception as e:
+            print(f"Timeout while loading {search_url}.", e)
+            return []
+
+        page.wait_for_selector("body")
+        time.sleep(5)
+
+        # Language and zoom functionality remains the same as in the previous script
+
+        try:
+            while True:
+                clickable_items = page.query_selector_all("//div[@role='feed']//a[@aria-label and starts-with(@href, 'https://www.google.com/maps')]")
+                if not clickable_items:
+                    break
+                    
+                for index, item in enumerate(clickable_items):
+                    href = item.get_attribute("href")
+                    if href in processed_urls:
+                        continue
+
+                    item.click(click_count=2)
+                    processed_urls.add(href)
+
+                    time.sleep(2)
+
+                    see_more = page.query_selector_all('//div[@class="MyEned"]//button[@aria-label="See more"]')
+                    for more_item in see_more:
+                        more_item.click()
+                        time.sleep(0.5)
+                        
+                    time.sleep(1)
+
+                    def clean_review_text(review_list): 
+                        if review_list: 
+                            cleaned_reviews = [review.replace('\n', '').strip() 
+                            for review in review_list] 
+                            return ' '.join(cleaned_reviews)
+                        return None
+
+                    page_source = page.content()
+                    tree = html.fromstring(page_source)
+
+                    current_url = page.url
+                    match = re.search(r"@(-?\d+\.\d+),(-?\d+\.\d+)", current_url)
+                    latitude = float(match.group(1)) if match else None
+                    longitude = float(match.group(2)) if match else None
+
+                    place = tree.xpath("//h1[@class='DUwDvf lfPIob']/text()")
+                    overview = tree.xpath("//div[@class='y0K5Df']//div[contains(@class,'PYvSYb')]/text()")
+                    address = tree.xpath("//button[@class='CsEnBe' and contains(@aria-label,'Address')]//div[contains(@class,'Io6YTe')]/text()")
+                    price = tree.xpath("(//div[@class='drwWxc'])[1]/text()")
+                    rating = tree.xpath("//div[contains(@class,'F7nice')]//span[contains(@aria-hidden,'true')]/text()")
+                    review = tree.xpath("//span[contains(@class,'wiI7pd')]/text()")
+                    review_count = tree.xpath('//span[contains(@aria-label, "reviews")]/text()')
+
+                    place = place[0] if place else None
+                    overview = overview[0] if overview else None
+                    address = address[0] if address else None
+                    rating = float(rating[0]) if rating else None
+                    review = clean_review_text(review) if review else None
+                    review_count = int(re.sub(r'\D', '', review_count[0])) if review_count else 0
+
+                    if price: 
+                        price = price[0].replace('Rp', '').replace('.', '').replace(',', '.').strip() 
+                        try: 
+                            price = float(price) 
+                        except ValueError: 
+                            price = 0.0
+                    else: 
+                        price = 0.0
+
+                    data_entry = {
+                        "Place": place,
+                        "Overview": overview,
+                        "Category": category_name,
+                        "Address": address,
+                        "City": city_name,
+                        "Price": price,
+                        "Rating": rating,
+                        "Review": review,
+                        "Review_count": review_count,
+                        "Latitude": latitude,
+                        "Longitude": longitude,
+                    }
+
+                    try:
+                        about_tab = page.query_selector("//button[contains(@aria-label, 'About')]")
+                        if about_tab:
+                            about_tab.click()
+                            time.sleep(1)
+
+                            page_source = page.content()
+                            tree = html.fromstring(page_source)
+
+                            accessibility = tree.xpath('//h2[text()="Accessibility"]/following-sibling::ul//span[contains(@aria-label,"Has")]')
+                            amenities = tree.xpath('//h2[text()="Amenities"]/following-sibling::ul//span[contains(@aria-label,"Has")]/text()')
+                            children = tree.xpath('//h2[text()="Children"]/following-sibling::ul//span[contains(@aria-label,"Good")]')
+
+                            data_entry["Wheelchair-accessible"] = "true" if accessibility else "false"
+                            data_entry["Amenities"] = amenities if amenities else None
+                            data_entry["Good for children"] = "true" if children else "false"
+
+                    except Exception as e:
+                        print(f"Error during button clicking or data extraction: {e}")
+
+                    print(f"Extracted data: {data_entry}")
+                    extracted_data.append(data_entry)
+
+                    time.sleep(1)
+                    page.evaluate("document.querySelector('div[role=feed]').scrollBy(0, 500)")
+                    print("Scrolling...")
+
+                end_list = page.query_selector('//span[contains(text(),"end of the list.")]')
+                if end_list:
+                    break    
+
+        except Exception as e:
+            print("Error during clicking or extracting data:", e)
+
+        browser.close()
+
+    return extracted_data
+
+# Read cities from Excel
+city_data = pd.read_excel('city_list.xlsx')
+city_list = city_data['City'].tolist()
+category_list = city_data['Category'].tolist()
+
+# Main scraping and JSON output process
+final_data = {}
+
+for city_name in city_list:
+    city_data_collection = {}
+    for category_name in category_list:
+        print(f"Scraping data for {city_name} and category {category_name}...")
+        city_name = city_name.strip()
+        category_name = category_name.strip()
+        
+        scraped_data = scrape_google_maps(city_name, category_name)
+        city_data_collection[category_name] = scraped_data
+    
+    final_data[city_name] = city_data_collection
+
+# Save the entire dataset to a JSON file
+output_file_path = 'C:/Users/muvir/Documents/Bangkit 2024/Capstone Project/Web scraping/web_scraping_gmaps/Data/dataset_all.json'
+with open(output_file_path, 'w', encoding='utf-8') as f:
+    json.dump(final_data, f, ensure_ascii=False, indent=4)
+
+print(f"Data saved to '{output_file_path}'.")
